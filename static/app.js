@@ -631,6 +631,10 @@ const inferState = {
   resultKey: "",      // 结果产生时的输入指纹
   appliedSig: "",     // 上一次点「应用」之后的输入指纹（与当前一致则结果仍代表现状）
   applied: false,     // 当前结果是否已写回图层
+  invalidated: false, // 结果展示后参与输入是否曾变化过：一旦置位，改回原值也不恢复应用资格
+  inflightId: 0,      // 当前仍可落地的在途请求序号；0 表示无（已完成 / 被更新请求取代 / 因输入变化作废）
+  inflightSig: "",    // 当前在途请求发出时的输入指纹
+  reqSeq: 0,          // 单调递增的请求序号源，永不归零，避免请求序号在完成后被新请求复用
 };
 
 let orderSlotBefore = "";
@@ -668,6 +672,7 @@ function syncInferPanel(solveResult) {
     inferState.resultKey = "";
     inferState.appliedSig = "";
     inferState.applied = false;
+    inferState.invalidated = false;
     elInferResult.innerHTML = "";
     elInferErrors.hidden = true;
   } else {
@@ -748,25 +753,40 @@ function updateInferRunHint() {
 }
 
 function markInferStaleness() {
+  // 参与输入（图层 / 样本 / 先后关系 / 反推顺序 / 待调选择）变化时：在途请求（及其
+  // 响应）立即失效，不能再改动建议 / 错误 / 加载状态。这里仅结束加载态并作废在途
+  // 请求；旧响应返回后会在响应守卫处被丢弃。reqSeq 不清零，请求序号始终单调递增。
+  if (inferState.inflightId !== 0 && inferSignature() !== inferState.inflightSig) {
+    inferState.inflightId = 0;
+    inferState.inflightSig = "";
+    elInferStatus.textContent = "";
+    elInferStatus.className = "status";
+  }
   if (!inferState.result) return;
   const sig = inferSignature();
-  // 结果产生时、或上次应用建议值之后的状态，都视为与当前结果一致
-  const fresh = sig === inferState.resultKey || sig === inferState.appliedSig;
+  // 结果产生时、或上次应用建议值之后的状态，都视为与当前结果一致；
+  // 但只要曾不一致过，应用资格即被永久撤销——改回原值也不能恢复
+  const matches = sig === inferState.resultKey || sig === inferState.appliedSig;
+  if (!matches) inferState.invalidated = true;
+  const fresh = matches && !inferState.invalidated;
   inferState.applied = inferState.applied && fresh;
   const old = elInferResult.querySelector(".stale-note");
   if (!fresh && !old) {
     const note = document.createElement("div");
     note.className = "stale-note";
-    note.textContent = "输入或选择已变化，以下结果可能过期，请重新反推。";
+    note.textContent = "输入或选择已变化，以下建议已失效（即使改回原值也不能再应用），请重新反推。";
     elInferResult.prepend(note);
   } else if (fresh && old) {
     old.remove();
   }
+  // 应用按钮的可用状态随失效状态同步：失效的建议不能再写回图层
+  const applyBtn = elInferResult.querySelector('button[data-act="infer-apply"]');
+  if (applyBtn) applyBtn.disabled = !fresh || inferState.applied;
 }
 
-// 结果是否仍代表当前输入；false 时「应用」按钮应可重新点击
+// 结果是否仍代表当前输入且保有应用资格；false 时「应用」按钮不可点击
 function inferResultFresh() {
-  if (!inferState.result) return false;
+  if (!inferState.result || inferState.invalidated) return false;
   const sig = inferSignature();
   return sig === inferState.resultKey || sig === inferState.appliedSig;
 }
@@ -827,6 +847,18 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
 });
 
+// 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
+// 请求序号取自永不归零的单调计数器，因此某请求完成（成功 / HTTP 错误 / 连接异常 /
+// 解析失败）不会释放其序号：输入不变时连续反推，较早请求即便后返回也无法冒充成
+// 新请求，其各种结局都只会被直接忽略，不触碰当前建议、错误提示或加载状态。
+function inferResponseCurrent(reqId, reqSig) {
+  return (
+    inferState.inflightId === reqId &&
+    inferState.inflightSig === reqSig &&
+    inferSignature() === reqSig
+  );
+}
+
 async function runInfer() {
   const payload = {
     layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
@@ -835,6 +867,13 @@ async function runInfer() {
     order: inferState.order,
     adjustIds: [...inferState.picks].sort(),
   };
+  // 从永不归零的单调计数器取得本次请求序号，并登记为当前在途请求；
+  // 连续反推或输入变化时，旧请求即便后返回也不会覆盖较新结果（见 inferResponseCurrent）。
+  const reqId = ++inferState.reqSeq;
+  inferState.inflightId = reqId;
+  const reqSig = inferSignature();
+  inferState.inflightSig = reqSig;
+
   elInferStatus.textContent = "反推中…";
   elInferStatus.className = "status busy";
   elInferErrors.hidden = true;
@@ -845,7 +884,13 @@ async function runInfer() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (!inferResponseCurrent(reqId, reqSig)) return; // 已有更新的请求或输入已变，丢弃旧响应
     const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前必须再过一次守卫，
+    // 过期响应无论成功、HTTP 错误还是解析失败都不得改动建议、错误与加载状态
+    if (!inferResponseCurrent(reqId, reqSig)) return;
+    inferState.inflightId = 0;
+    inferState.inflightSig = "";
     elInferStatus.textContent = "";
     elInferStatus.className = "status";
     if (!resp.ok) {
@@ -853,10 +898,14 @@ async function runInfer() {
       return;
     }
     inferState.result = data;
-    inferState.resultKey = inferSignature();
+    inferState.resultKey = reqSig;
     inferState.applied = false;
+    inferState.invalidated = false; // 新建议落地，重新获得应用资格
     renderInferResult(data);
   } catch (err) {
+    if (!inferResponseCurrent(reqId, reqSig)) return;
+    inferState.inflightId = 0;
+    inferState.inflightSig = "";
     elInferStatus.textContent = "";
     elInferStatus.className = "status";
     showInferErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
@@ -895,7 +944,8 @@ function renderInferResult(r) {
     .map((s, k) => renderInferSample(s, r.beforeSamples[k]))
     .join("");
 
-  const applied = inferResultFresh() && inferState.applied;
+  const fresh = inferResultFresh();
+  const applied = fresh && inferState.applied;
   elInferResult.innerHTML = `
     <table class="adj-table">
       <thead><tr><th>待调图层</th><th>原不透明度</th><th></th><th>建议不透明度</th></tr></thead>
@@ -910,7 +960,7 @@ function renderInferResult(r) {
     ${samples}
     <div class="infer-apply-row">
       <button class="btn btn-small" data-act="infer-apply" type="button"
-              ${applied ? "disabled" : ""}>应用建议值回图层并重新求解</button>
+              ${applied || !fresh ? "disabled" : ""}>应用建议值回图层并重新求解</button>
       ${applied ? '<span class="applied-note">已应用，左侧图层与上方校准结果已更新。</span>' : ""}
     </div>
   `;
@@ -955,7 +1005,8 @@ function triCell(tag, hex, rgb, sse) {
 
 function applyInferResult() {
   const r = inferState.result;
-  if (!r) return;
+  // 应用前再次核对资格：建议已失效（参与输入曾变化，即使改回原值）时不改任何图层
+  if (!r || inferState.applied || !inferResultFresh()) return;
   r.adjustments.forEach((a) => {
     const layer = state.layers.find((l) => l.id === a.id);
     if (layer) layer.opacity = a.suggestedOpacity;
@@ -1699,6 +1750,7 @@ function appendReviewSample() {
   render();
   noteSolveInputChanged();
   markCycleStaleness();
+  markInferStaleness();
   markSuggestStaleness();
   renderSuggestControls();
   markReviewStaleness();
