@@ -31,6 +31,7 @@ let solveInputEpoch = 0;
 
 function noteSolveInputChanged() {
   solveInputEpoch += 1;
+  noteInferInputChanged(); // 图层 / 样本 / 关系变化同样作废反推流程的在途请求与建议
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -628,10 +629,21 @@ const inferState = {
   order: [],          // 当前确认顺序（ID 数组）
   picks: new Set(),   // 勾选的待调 ID
   result: null,       // 最近一次成功返回
-  resultKey: "",      // 结果产生时的输入指纹
-  appliedSig: "",     // 上一次点「应用」之后的输入指纹（与当前一致则结果仍代表现状）
+  resultEpoch: 0,     // 结果产生（或应用）时的输入纪元；与当前纪元不一致即失去应用资格
   applied: false,     // 当前结果是否已写回图层
+  inflightId: 0,      // 当前仍可落地的在途请求序号；0 表示无（已完成 / 被更新请求取代 / 因输入变化作废）
+  inflightEpoch: 0,   // 当前在途请求发出时的输入纪元
+  reqSeq: 0,          // 单调递增的请求序号源，永不归零，避免请求序号在完成后被新请求复用
 };
+
+// 反推流程的输入纪元：图层、样本、先后关系（随 noteSolveInputChanged 联动）、确认顺序
+// 或待调选择每变化一次就 +1（只增不减）。请求发出时记录当前纪元；响应落地前纪元若已变，
+// 说明等待或读取响应期间输入发生过变化——该请求立即作废，即使之后改回原值也不会恢复。
+let inferInputEpoch = 0;
+
+function noteInferInputChanged() {
+  inferInputEpoch += 1;
+}
 
 let orderSlotBefore = "";
 
@@ -642,17 +654,6 @@ const elInferHint = $("#inferHint");
 const elInferErrors = $("#inferErrors");
 const elInferResult = $("#inferResult");
 const elInferStatus = $("#inferStatus");
-
-function inferSignature() {
-  // 用于判断已有反推结果是否对应当前输入
-  return JSON.stringify({
-    layers: state.layers,
-    samples: state.samples,
-    relations: state.relations,
-    order: inferState.order,
-    picks: [...inferState.picks].sort(),
-  });
-}
 
 function syncInferPanel(solveResult) {
   elInferCard.hidden = false;
@@ -665,8 +666,6 @@ function syncInferPanel(solveResult) {
     inferState.order = [...solveResult.order];
     inferState.picks = new Set();
     inferState.result = null;
-    inferState.resultKey = "";
-    inferState.appliedSig = "";
     inferState.applied = false;
     elInferResult.innerHTML = "";
     elInferErrors.hidden = true;
@@ -748,27 +747,36 @@ function updateInferRunHint() {
 }
 
 function markInferStaleness() {
+  // 输入纪元变化时：在途请求（及其响应）立即失效，不能再改动建议 / 错误 / 加载状态。
+  // 这里仅结束加载态并作废在途请求；旧响应返回后会在响应守卫处被丢弃。
+  // 注意 reqSeq 不清零，请求序号始终单调递增，旧序号不会被后续请求复用。
+  if (inferState.inflightId !== 0 && inferInputEpoch !== inferState.inflightEpoch) {
+    inferState.inflightId = 0;
+    inferState.inflightEpoch = 0;
+    elInferStatus.textContent = "";
+    elInferStatus.className = "status";
+  }
   if (!inferState.result) return;
-  const sig = inferSignature();
-  // 结果产生时、或上次应用建议值之后的状态，都视为与当前结果一致
-  const fresh = sig === inferState.resultKey || sig === inferState.appliedSig;
+  const fresh = inferResultFresh();
   inferState.applied = inferState.applied && fresh;
   const old = elInferResult.querySelector(".stale-note");
   if (!fresh && !old) {
     const note = document.createElement("div");
     note.className = "stale-note";
-    note.textContent = "输入或选择已变化，以下结果可能过期，请重新反推。";
+    note.textContent = "输入或选择已变化，以下建议已失效（即使改回原值也不能再应用），请重新反推。";
     elInferResult.prepend(note);
   } else if (fresh && old) {
     old.remove();
   }
+  // 应用按钮随失效状态同步：失效后不可再点击（点击处理里也会再次核对资格）
+  const applyBtn = elInferResult.querySelector('button[data-act="infer-apply"]');
+  if (applyBtn) applyBtn.disabled = !fresh || inferState.applied;
 }
 
-// 结果是否仍代表当前输入；false 时「应用」按钮应可重新点击
+// 结果是否仍代表当前输入并具有应用资格：结果产生（或应用）时的输入纪元与当前一致。
+// 纪元只增不减，输入每变化一次就永久失配——即使改回原值也不能恢复。
 function inferResultFresh() {
-  if (!inferState.result) return false;
-  const sig = inferSignature();
-  return sig === inferState.resultKey || sig === inferState.appliedSig;
+  return !!inferState.result && inferInputEpoch === inferState.resultEpoch;
 }
 
 document.addEventListener("change", (e) => {
@@ -781,6 +789,7 @@ document.addEventListener("change", (e) => {
     const other = inferState.order.findIndex((id, p) => p !== pos && id === t.value);
     inferState.order[pos] = t.value;
     if (other !== -1 && prev) inferState.order[other] = prev;
+    noteInferInputChanged();
     renderInferControls();
   } else if (act === "transition-order") {
     const pos = Number(t.dataset.pos);
@@ -795,6 +804,7 @@ document.addEventListener("change", (e) => {
     const id = t.dataset.id;
     if (t.checked) inferState.picks.add(id);
     else inferState.picks.delete(id);
+    noteInferInputChanged();
     renderInferControls();
   } else if (act === "review-bg") {
     reviewState.selectedBackground = t.value;
@@ -827,6 +837,18 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
 });
 
+// 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
+// 请求序号取自永不归零的单调计数器，因此某请求完成（成功 / HTTP 错误 / 连接异常 /
+// 解析失败）不会释放其序号：输入不变时连续反推，较早请求即便后返回也无法冒充成
+// 新请求，其各种结局都只会被直接忽略，不触碰当前建议、错误提示或加载状态。
+function inferResponseCurrent(reqId, reqEpoch) {
+  return (
+    inferState.inflightId === reqId &&
+    inferState.inflightEpoch === reqEpoch &&
+    inferInputEpoch === reqEpoch
+  );
+}
+
 async function runInfer() {
   const payload = {
     layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
@@ -835,6 +857,13 @@ async function runInfer() {
     order: inferState.order,
     adjustIds: [...inferState.picks].sort(),
   };
+  // 从永不归零的单调计数器取得本次请求序号，并登记为当前在途请求；
+  // 连续反推或输入变化时，旧请求即便后返回也不会覆盖较新结果（见 inferResponseCurrent）。
+  const reqId = ++inferState.reqSeq;
+  inferState.inflightId = reqId;
+  const reqEpoch = inferInputEpoch;
+  inferState.inflightEpoch = reqEpoch;
+
   elInferStatus.textContent = "反推中…";
   elInferStatus.className = "status busy";
   elInferErrors.hidden = true;
@@ -845,7 +874,13 @@ async function runInfer() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (!inferResponseCurrent(reqId, reqEpoch)) return; // 已有更新的请求或输入已变，丢弃旧响应
     const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前必须再过一次守卫，
+    // 过期响应无论成功、HTTP 错误还是解析失败都不得改动建议、错误与加载状态
+    if (!inferResponseCurrent(reqId, reqEpoch)) return;
+    inferState.inflightId = 0;
+    inferState.inflightEpoch = 0;
     elInferStatus.textContent = "";
     elInferStatus.className = "status";
     if (!resp.ok) {
@@ -853,10 +888,13 @@ async function runInfer() {
       return;
     }
     inferState.result = data;
-    inferState.resultKey = inferSignature();
+    inferState.resultEpoch = reqEpoch;
     inferState.applied = false;
     renderInferResult(data);
   } catch (err) {
+    if (!inferResponseCurrent(reqId, reqEpoch)) return;
+    inferState.inflightId = 0;
+    inferState.inflightEpoch = 0;
     elInferStatus.textContent = "";
     elInferStatus.className = "status";
     showInferErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
@@ -910,7 +948,7 @@ function renderInferResult(r) {
     ${samples}
     <div class="infer-apply-row">
       <button class="btn btn-small" data-act="infer-apply" type="button"
-              ${applied ? "disabled" : ""}>应用建议值回图层并重新求解</button>
+              ${applied || !inferResultFresh() ? "disabled" : ""}>应用建议值回图层并重新求解</button>
       ${applied ? '<span class="applied-note">已应用，左侧图层与上方校准结果已更新。</span>' : ""}
     </div>
   `;
@@ -955,17 +993,20 @@ function triCell(tag, hex, rgb, sse) {
 
 function applyInferResult() {
   const r = inferState.result;
-  if (!r) return;
+  // 应用前再次核对资格：结果产生后输入（图层 / 样本 / 关系 / 顺序 / 待调选择）曾变化的，
+  // 建议已失去应用资格——不改任何图层（即使之后改回原值也不能恢复）
+  if (!r || !inferResultFresh()) return;
   r.adjustments.forEach((a) => {
     const layer = state.layers.find((l) => l.id === a.id);
     if (layer) layer.opacity = a.suggestedOpacity;
   });
-  // 记录应用后的状态指纹：在再次改动输入前，结果始终代表当前图层
   inferState.applied = true;
-  inferState.appliedSig = inferSignature();
-  renderInferResult(inferState.result);
   render();
-  noteSolveInputChanged();
+  noteSolveInputChanged(); // 不透明度已写回：图层输入变化，在途反推请求一并作废
+  // 结果纪元推进到应用后的输入纪元：在再次改动输入前，结果始终代表当前图层
+  inferState.resultEpoch = inferInputEpoch;
+  markInferStaleness(); // 作废在途反推请求并结束其加载态；结果仍有效，不出现过期提示
+  renderInferResult(r);
   markCycleStaleness();
   markTransitionStaleness();
   runSolve();
@@ -1699,6 +1740,7 @@ function appendReviewSample() {
   render();
   noteSolveInputChanged();
   markCycleStaleness();
+  markInferStaleness();
   markSuggestStaleness();
   renderSuggestControls();
   markReviewStaleness();
